@@ -287,17 +287,11 @@ def _analyze(
     )
 
 
-_DETAILED_TEMPLATE = """请按以下分区逐项描述这张图片。每个分区都必须填写，该分区无内容时写"无"。
-
-1. 页面标题与章节标题：逐字转录所有标题文字（含标点）。
-2. 正文文字：逐字转录所有可见文字，保留数字、单位、公式符号、上下标；不要概括、不要改写。
-3. 表格：用 Markdown 表格逐行还原，保留全部数值和列名；无表格写"无"。
-4. 图表：描述坐标轴标签、刻度范围、图例、曲线/柱状趋势、数值标注；无图表写"无"。
-5. 图注 / 脚注 / 来源 / 页码：逐字转录。
-6. 图片与图标：描述每张图片/图标的内容、位置、大小关系。
-7. 整体布局：分区位置、颜色方案、视觉层次、重点强调的元素。
-
-最后单独输出一行：==缺失项== ，列出你无法辨认或不确定的内容（如被遮挡、分辨率不足的部分）。"""
+_DETAILED_TEMPLATE = """我是DeepSeek，没有多模态，请你作为我的眼睛返回图片的信息：
+1. 内容：逐字转录所有文字、数字、表格（不要概括、不要改写），保留精确数值。
+2. 布局：分区位置、层级、视觉重点，可给出坐标。
+3. 图表：坐标轴、刻度、图例、色标数值。
+4. 如果有显示异常（损坏/遮挡/乱码），请指出。"""
 
 
 def _analyze_detailed(
@@ -305,39 +299,27 @@ def _analyze_detailed(
     prompt: str = "",
     thinking: bool | None = None,
 ) -> str:
-    """对图片做完整描述：结构化分区主调用 + 一次全局查漏补缺。
+    """对图片做完整描述：逐字转录 + 布局/坐标/图表细节 + 异常检测。
 
-    主调用用更大的 max_tokens/timeout（长模板 + 逐字转录时火山端响应明显更慢）；
-    随后对主描述中缺失/模糊的部分做单次合并追问，避免逐象限调用拖慢整体。
+    单轮调用（实测查漏补缺轮多数情况返回"无"，已去掉以省时）；
+    用更大的 max_tokens/timeout（逐字转录时火山端响应更慢）。
     """
     first_prompt = (
         f"{_DETAILED_TEMPLATE}\n\n补充关注点：{prompt}" if prompt
         else _DETAILED_TEMPLATE
     )
-    first = _analyze(image, first_prompt, max_tokens=4096, timeout=240, thinking=thinking)
-    try:
-        detail = _analyze(
-            image,
-            "这是同一张图。基于以下描述，找出其中写\"无\"、模糊或遗漏的部分"
-            "（例如被遮挡的文字、没转录的数字、没描述的角落元素），"
-            "只输出这些缺失部分的补充内容，不要重复已描述的内容。\n"
-            f"已有描述：\n{first[:3000]}",
-            max_tokens=2048,
-            timeout=180,
-            thinking=thinking,
-        )
-        return f"{first}\n\n【查漏补充】\n{detail}"
-    except Exception:
-        return first
+    return _analyze(image, first_prompt, max_tokens=4096, timeout=240, thinking=thinking)
 
 
 def _resolve_thinking(detail: bool, thinking: bool | None) -> bool | None:
-    """按场景决定思考默认值，thinking 显式传入时覆盖。"""
+    """按场景决定思考默认值，thinking 显式传入时覆盖。
+
+    默认一律关思考（实测 detail+思考开会卡死 210s+）；需要深度推理时
+    显式传 thinking=True。
+    """
     if thinking is not None:
         return thinking
-    if detail:
-        return True   # 完整描述需要深度推理
-    return False      # 普通快速浏览
+    return False
 
 
 # ---------------------------------------------------------------------------

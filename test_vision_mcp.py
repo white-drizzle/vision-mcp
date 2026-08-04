@@ -21,9 +21,9 @@ def test_chat_default_thinking_preserved():
 
 
 def test_resolve_thinking_scenarios():
-    # detail 开思考，其余关
-    assert vision_mcp._resolve_thinking(detail=True, thinking=None) is True
+    # 默认一律关思考（含 detail，避免 detail+思考开卡死）
+    assert vision_mcp._resolve_thinking(detail=True, thinking=None) is False
     assert vision_mcp._resolve_thinking(detail=False, thinking=None) is False
     # 显式覆盖优先
-    assert vision_mcp._resolve_thinking(detail=True, thinking=False) is False
+    assert vision_mcp._resolve_thinking(detail=True, thinking=True) is True
     assert vision_mcp._resolve_thinking(detail=False, thinking=True) is True
