@@ -11,6 +11,7 @@
 运行：python vision_mcp.py
 """
 import base64
+import glob
 import json
 import os
 import re
@@ -203,15 +204,16 @@ def _read_image_bytes(source: str) -> tuple[bytes, str, str]:
     raise ValueError(f"无法识别的图片来源: {source[:60]}…")
 
 
-def _chat(messages: list[dict]) -> dict:
+def _chat(messages: list[dict], max_tokens: int = 2048, timeout: float = 90) -> dict:
     """调用火山 Agent Plan /chat/completions，返回 assistant content 文本。
 
     429 / 5xx 自动重试（最多 3 次，指数退避），应对火山端临时过载。
+    max_tokens / timeout 可按需调大（长描述、逐字转录场景火山端响应更慢）。
     """
     token = os.environ.get("ARK_AUTH_TOKEN")
     if not token:
         raise RuntimeError("缺少环境变量 ARK_AUTH_TOKEN（火山 Agent Plan AUTH_TOKEN）")
-    payload = {"model": MODEL, "messages": messages, "max_tokens": 2048}
+    payload = {"model": MODEL, "messages": messages, "max_tokens": max_tokens}
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -225,11 +227,11 @@ def _chat(messages: list[dict]) -> dict:
 
             body = json.dumps(payload).encode()
             req = Req(f"{ARK_BASE}/chat/completions", data=body, headers=headers)
-            with open_(req, timeout=90) as r:
+            with open_(req, timeout=timeout) as r:
                 return getattr(r, "status", 200), r.read()
         else:
             resp = requests.post(
-                f"{ARK_BASE}/chat/completions", json=payload, headers=headers, timeout=90
+                f"{ARK_BASE}/chat/completions", json=payload, headers=headers, timeout=timeout
             )
             return resp.status_code, resp.content
 
@@ -249,7 +251,12 @@ def _chat(messages: list[dict]) -> dict:
         raise RuntimeError(f"无法解析响应: {data.decode('utf-8', 'replace')[:500]}")
 
 
-def _analyze(image: str, prompt: str) -> str:
+def _analyze(
+    image: str,
+    prompt: str,
+    max_tokens: int = 2048,
+    timeout: float = 90,
+) -> str:
     data, mime, _ = _read_image_bytes(image)
     if len(data) > MAX_IMAGE_BYTES:
         raise ValueError(f"图片过大（{len(data)} bytes），上限 {MAX_IMAGE_BYTES}")
@@ -258,7 +265,205 @@ def _analyze(image: str, prompt: str) -> str:
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
     ]
-    return _chat([{"role": "user", "content": content}])
+    return _chat([{"role": "user", "content": content}], max_tokens=max_tokens, timeout=timeout)
+
+
+_DETAILED_TEMPLATE = """请按以下分区逐项描述这张图片。每个分区都必须填写，该分区无内容时写"无"。
+
+1. 页面标题与章节标题：逐字转录所有标题文字（含标点）。
+2. 正文文字：逐字转录所有可见文字，保留数字、单位、公式符号、上下标；不要概括、不要改写。
+3. 表格：用 Markdown 表格逐行还原，保留全部数值和列名；无表格写"无"。
+4. 图表：描述坐标轴标签、刻度范围、图例、曲线/柱状趋势、数值标注；无图表写"无"。
+5. 图注 / 脚注 / 来源 / 页码：逐字转录。
+6. 图片与图标：描述每张图片/图标的内容、位置、大小关系。
+7. 整体布局：分区位置、颜色方案、视觉层次、重点强调的元素。
+
+最后单独输出一行：==缺失项== ，列出你无法辨认或不确定的内容（如被遮挡、分辨率不足的部分）。"""
+
+
+def _analyze_detailed(image: str, prompt: str = "") -> str:
+    """对图片做完整描述：结构化分区主调用 + 一次全局查漏补缺。
+
+    主调用用更大的 max_tokens/timeout（长模板 + 逐字转录时火山端响应明显更慢）；
+    随后对主描述中缺失/模糊的部分做单次合并追问，避免逐象限调用拖慢整体。
+    """
+    first_prompt = (
+        f"{_DETAILED_TEMPLATE}\n\n补充关注点：{prompt}" if prompt
+        else _DETAILED_TEMPLATE
+    )
+    first = _analyze(image, first_prompt, max_tokens=4096, timeout=240)
+    try:
+        detail = _analyze(
+            image,
+            "这是同一张图。基于以下描述，找出其中写\"无\"、模糊或遗漏的部分"
+            "（例如被遮挡的文字、没转录的数字、没描述的角落元素），"
+            "只输出这些缺失部分的补充内容，不要重复已描述的内容。\n"
+            f"已有描述：\n{first[:3000]}",
+            max_tokens=2048,
+            timeout=180,
+        )
+        return f"{first}\n\n【查漏补充】\n{detail}"
+    except Exception:
+        return first
+
+
+# ---------------------------------------------------------------------------
+# 会话日志定位：从 Claude Code 当前会话的 JSONL 日志里取出用户粘贴的图片。
+# MCP server 是 Claude Code 的子进程（stdio），会继承 CLAUDE_CODE_SESSION_ID
+# 和 CLAUDE_CODE_EXECPATH，可据此定位到 ~/.claude/projects/<项目>/<会话>.jsonl。
+# 用户粘贴的图片以 {"type":"image","source":{"type":"base64","media_type":...,"data":...}}
+# 形式出现在 type=="user" 的消息里，取最后一条即"最近粘贴的那张图"。
+# ---------------------------------------------------------------------------
+
+
+def _claude_projects_dir() -> str:
+    """返回 ~/.claude/projects 目录。"""
+    return os.path.join(os.path.expanduser("~"), ".claude", "projects")
+
+
+def _extract_pasted_image(line: str) -> tuple[bytes, str] | None:
+    """从一行 JSONL 中提取用户消息里粘贴的图片，返回 (bytes, mime)。"""
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if obj.get("type") != "user":
+        return None
+    msg = obj.get("message") or {}
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return None
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        src = item.get("source") or {}
+        if item.get("type") == "image" and src.get("type") == "base64" and src.get("data"):
+            try:
+                data = base64.b64decode(src["data"])
+            except Exception:
+                continue
+            return data, src.get("media_type", "image/png")
+    return None
+
+
+def _latest_pasted_image_from_log(log_path: str) -> tuple[bytes, str] | None:
+    """扫描会话日志，返回最后一张粘贴图片 (bytes, mime)。"""
+    result = None
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                found = _extract_pasted_image(line)
+                if found:
+                    result = found
+    except OSError:
+        return None
+    return result
+
+
+def _find_current_session_log() -> str | None:
+    """定位当前会话的 JSONL 日志路径。
+
+    优先用 CLAUDE_CODE_SESSION_ID 在 ~/.claude/projects 下按 mtime 找
+    对应 `<sessionId>.jsonl`；找不到再退回"最近 10 分钟内修改的会话日志"。
+    """
+    projects = _claude_projects_dir()
+    if not os.path.isdir(projects):
+        return None
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
+    now = time.time()
+
+    def _recent_logs():
+        for root, _dirs, files in os.walk(projects):
+            for fn in files:
+                if not fn.endswith(".jsonl"):
+                    continue
+                p = os.path.join(root, fn)
+                try:
+                    if now - os.path.getmtime(p) <= 600:
+                        yield p
+                except OSError:
+                    continue
+
+    if sid:
+        for p in _recent_logs():
+            if os.path.basename(p) == f"{sid}.jsonl":
+                return p
+        for root, _dirs, files in os.walk(projects):
+            for fn in files:
+                if fn == f"{sid}.jsonl":
+                    return os.path.join(root, fn)
+    try:
+        return max(_recent_logs(), key=os.path.getmtime)
+    except ValueError:
+        return None
+
+
+def _scan_recent_temp_images(seconds: int = 1800) -> list[str]:
+    """兜底：在系统临时目录扫描近期图片文件（按文件签名识别），按 mtime 倒序。"""
+    img_sign = re.compile(
+        rb"\x89PNG\r\n\x1a\n|^\xff\xd8\xff|^RIFF.{4}WEBP|^\x00\x00\x00.f.t.y.p|^GIF8"
+    )
+    out = []
+    for base in (tempfile.gettempdir(),):
+        try:
+            entries = os.scandir(base)
+        except OSError:
+            continue
+        with entries as it:
+            for e in it:
+                try:
+                    if not e.is_file():
+                        continue
+                    if time.time() - e.stat().st_mtime > seconds:
+                        continue
+                    with open(e.path, "rb") as f:
+                        head = f.read(16)
+                    if img_sign.match(head):
+                        out.append(e.path)
+                except OSError:
+                    continue
+    out.sort(key=os.path.getmtime, reverse=True)
+    return out
+
+
+def _resolve_pasted_image() -> tuple[bytes, str, str]:
+    """找到用户最近粘贴的图片，返回 (bytes, mime, 来源描述)。
+
+    顺序：当前会话日志 → 最近临时目录图片。找不到抛出 ValueError。
+    """
+    log = _find_current_session_log()
+    if log:
+        found = _latest_pasted_image_from_log(log)
+        if found:
+            data, mime = found
+            return data, mime, f"会话日志 {os.path.basename(log)}"
+    cands = _scan_recent_temp_images()
+    if cands:
+        path = cands[0]
+        with open(path, "rb") as f:
+            data = f.read()
+        return data, _guess_mime(path, data), f"临时目录 {os.path.basename(path)}"
+    raise ValueError("未找到粘贴的图片：既不在当前会话日志，临时目录也没有近期图片")
+
+
+def _guess_mime(path: str, data: bytes) -> str:
+    """按文件签名猜测图片 MIME（优先扩展名，其次魔数）。"""
+    mime_by_ext = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif", ".avif": "image/avif", ".bmp": "image/bmp",
+    }
+    mime_by_sig = {
+        b"\x89PNG": "image/png", b"\xff\xd8": "image/jpeg", b"RIFF": "image/webp",
+        b"GIF8": "image/gif", b"ftyp": "image/avif",
+    }
+    ext = os.path.splitext(path)[1].lower()
+    if ext in mime_by_ext:
+        return mime_by_ext[ext]
+    for sig, m in mime_by_sig.items():
+        if data[:8].startswith(sig):
+            return m
+    return "image/jpeg"
+
 
 
 def _find_soffice() -> str:
@@ -495,14 +700,22 @@ def check_ppt_overlap(
 
 
 @mcp.tool()
-def analyze_image(image: str, prompt: str = "请详细描述这张图片的内容。") -> str:
+def analyze_image(
+    image: str,
+    prompt: str = "请详细描述这张图片的内容。",
+    detail: bool = False,
+) -> str:
     """分析一张图片，返回视觉模型的文字描述。
 
     Args:
         image: 图片来源 —— 本地文件路径，或 http(s) URL，或 data URL，或 base64。
         prompt: 想要模型关注什么（默认详细描述）。
+        detail: 设为 True 时启用完整描述模式 —— 结构化分区 + 四象限两轮补齐，
+                尽量捕获全部文字/数字/表格，适合学术文献页等需要完整信息的场景。
     """
     try:
+        if detail:
+            return _analyze_detailed(image, prompt)
         return _analyze(image, prompt)
     except Exception as e:
         return f"[vision-mcp 错误] {e}"
@@ -512,6 +725,41 @@ def analyze_image(image: str, prompt: str = "请详细描述这张图片的内�
 def describe_image(image: str) -> str:
     """快速浏览图片：输出一段通用描述（适合不指定任务的场合）。"""
     return _analyze(image, "请用简洁的中文描述这张图片的大致内容。")
+
+
+@mcp.tool()
+def analyze_pasted_image(
+    prompt: str = "请用中文详细描述这张图片的内容。",
+    detail: bool = False,
+) -> str:
+    """分析对话中粘贴的最近一张图片（无需提供文件路径）。
+
+    从当前 Claude Code 会话日志里提取用户粘贴的最后一张图片交给视觉模型，
+    找不到时回退到系统临时目录扫描近期图片文件。
+
+    Args:
+        prompt: 想要模型关注什么（默认详细描述）。
+        detail: 设为 True 时启用完整描述模式 —— 结构化分区 + 四象限两轮补齐，
+                尽量捕获全部文字/数字/表格，适合学术文献页等需要完整信息的场景。
+    """
+    try:
+        data, mime, source = _resolve_pasted_image()
+        if len(data) > MAX_IMAGE_BYTES:
+            return f"[vision-mcp 错误] 图片过大（{len(data)} bytes），上限 {MAX_IMAGE_BYTES}"
+        fd, tmp = tempfile.mkstemp(suffix=".png")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            if detail:
+                result = _analyze_detailed(tmp, prompt)
+            else:
+                result = _analyze(tmp, prompt)
+            return result + f"\n\n（图片来源：{source}）"
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    except Exception as e:
+        return f"[vision-mcp 错误] {e}"
 
 
 @mcp.tool()
