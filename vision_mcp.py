@@ -885,6 +885,8 @@ def describe_image(image: str) -> str:
 def analyze_pasted_image(
     prompt: str = "请用中文详细描述这张图片的内容。",
     detail: bool = False,
+    ocr_calibrate: bool = False,
+    thinking: bool | None = None,
 ) -> str:
     """分析对话中粘贴的最近一张图片（无需提供文件路径）。
 
@@ -893,8 +895,10 @@ def analyze_pasted_image(
 
     Args:
         prompt: 想要模型关注什么（默认详细描述）。
-        detail: 设为 True 时启用完整描述模式 —— 结构化分区 + 四象限两轮补齐，
+        detail: 设为 True 时启用完整描述模式 —— 结构化分区 + 查漏补缺，
                 尽量捕获全部文字/数字/表格，适合学术文献页等需要完整信息的场景。
+        ocr_calibrate: 设为 True 时启用本地 OCR 数字校准 + 结构化 JSON。
+        thinking: None=按场景默认（detail 开、其余关）；True/False=强制覆盖。
     """
     try:
         data, mime, source = _resolve_pasted_image()
@@ -904,10 +908,7 @@ def analyze_pasted_image(
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
-            if detail:
-                result = _analyze_detailed(tmp, prompt)
-            else:
-                result = _analyze(tmp, prompt)
+            result = _run_analysis(tmp, prompt, detail, ocr_calibrate, thinking)
             return result + f"\n\n（图片来源：{source}）"
         finally:
             if os.path.exists(tmp):
