@@ -92,21 +92,24 @@ def _build_colorbar_scales(items: list[dict]) -> dict[str, list[str]]:
     numeric = [it for it in items if re.fullmatch(r"[\d.]+", it["text"].strip())]
     numeric.sort(key=lambda it: min(p[0] for p in it["box"]))
     cols: list[list[dict]] = []
+    col_xs: list[float] = []  # 与 cols 平行，记录每列的代表 x
     for it in numeric:
         x = min(p[0] for p in it["box"])
         placed = False
-        for c in cols:
-            if abs(c[0][0] - x) <= 8:
+        for i, c in enumerate(cols):
+            if abs(col_xs[i] - x) <= 8:
                 c.append(it)
-                c[0][0] = x  # type: ignore[assignment]
+                col_xs[i] = min(col_xs[i], x)
                 placed = True
                 break
         if not placed:
             cols.append([it])
+            col_xs.append(x)
     scales: dict[str, list[str]] = {}
-    for i, c in enumerate(sorted(cols, key=lambda c: c[0][0])[:2]):
-        c.sort(key=lambda it: it["y_center"])
-        key = "left" if i == 0 else "right"
+    order = sorted(range(len(cols)), key=lambda i: col_xs[i])[:2]
+    for rank, i in enumerate(order):
+        c = sorted(cols[i], key=lambda it: it["y_center"])
+        key = "left" if rank == 0 else "right"
         scales[key] = [it["text"] for it in c]
     return scales
 
