@@ -204,16 +204,31 @@ def _read_image_bytes(source: str) -> tuple[bytes, str, str]:
     raise ValueError(f"无法识别的图片来源: {source[:60]}…")
 
 
-def _chat(messages: list[dict], max_tokens: int = 2048, timeout: float = 90) -> dict:
+def _thinking_payload(payload: dict, thinking: bool | None) -> dict:
+    """按 thinking 设置注入火山 thinking 字段。None = 不注入（遵循模型默认）。"""
+    if thinking is None:
+        return payload
+    payload["thinking"] = {"type": "enabled" if thinking else "disabled"}
+    return payload
+
+
+def _chat(
+    messages: list[dict],
+    max_tokens: int = 2048,
+    timeout: float = 90,
+    thinking: bool | None = None,
+) -> dict:
     """调用火山 Agent Plan /chat/completions，返回 assistant content 文本。
 
     429 / 5xx 自动重试（最多 3 次，指数退避），应对火山端临时过载。
     max_tokens / timeout 可按需调大（长描述、逐字转录场景火山端响应更慢）。
+    thinking: None=遵循模型默认；True/False=强制开/关深度思考。
     """
     token = os.environ.get("ARK_AUTH_TOKEN")
     if not token:
         raise RuntimeError("缺少环境变量 ARK_AUTH_TOKEN（火山 Agent Plan AUTH_TOKEN）")
     payload = {"model": MODEL, "messages": messages, "max_tokens": max_tokens}
+    payload = _thinking_payload(payload, thinking)
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",

@@ -89,3 +89,21 @@ def test_benchmark_scale_columns():
     finally:
         os.remove(tmp)
 
+
+import vision_mcp
+
+
+def test_chat_builds_thinking_payload_disabled():
+    payload = vision_mcp._thinking_payload({}, True)
+    assert payload["thinking"] == {"type": "enabled"}
+    payload = vision_mcp._thinking_payload({}, False)
+    assert payload["thinking"] == {"type": "disabled"}
+    payload = vision_mcp._thinking_payload({}, None)
+    assert "thinking" not in payload
+
+
+def test_chat_default_thinking_preserved():
+    payload = vision_mcp._thinking_payload({"model": "x"}, None)
+    assert "thinking" not in payload
+
+
