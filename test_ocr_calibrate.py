@@ -107,3 +107,21 @@ def test_chat_default_thinking_preserved():
     assert "thinking" not in payload
 
 
+def test_merge_numbers_high_confidence_wins():
+    vision_desc = "色标右图读 266.31，实际应为 262.15；表格波长 0.7-1.5μm"
+    ocr_items = [
+        {"box": [[0,0],[10,0],[10,10],[0,10]], "text": "262.31", "score": 1.0, "y_center": 5},
+        {"box": [[0,0],[10,0],[10,10],[0,10]], "text": "0.7-1.5", "score": 0.99, "y_center": 6},
+    ]
+    out = vision_mcp._calibrate_numbers(vision_desc, ocr_items)
+    assert "266.31" not in out, "vision's wrong number must be replaced"
+    assert "262.31" in out, "OCR correct number must appear"
+    assert "OCR" in out, "should annotate calibration"
+
+
+def test_merge_no_ocr_passthrough():
+    vision_desc = "这是描述，无数字"
+    out = vision_mcp._calibrate_numbers(vision_desc, [])
+    assert out == vision_desc
+
+

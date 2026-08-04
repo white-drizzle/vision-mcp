@@ -271,6 +271,7 @@ def _analyze(
     prompt: str,
     max_tokens: int = 2048,
     timeout: float = 90,
+    thinking: bool | None = None,
 ) -> str:
     data, mime, _ = _read_image_bytes(image)
     if len(data) > MAX_IMAGE_BYTES:
@@ -280,7 +281,10 @@ def _analyze(
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
     ]
-    return _chat([{"role": "user", "content": content}], max_tokens=max_tokens, timeout=timeout)
+    return _chat(
+        [{"role": "user", "content": content}],
+        max_tokens=max_tokens, timeout=timeout, thinking=thinking,
+    )
 
 
 _DETAILED_TEMPLATE = """请按以下分区逐项描述这张图片。每个分区都必须填写，该分区无内容时写"无"。
@@ -296,7 +300,11 @@ _DETAILED_TEMPLATE = """请按以下分区逐项描述这张图片。每个分�
 最后单独输出一行：==缺失项== ，列出你无法辨认或不确定的内容（如被遮挡、分辨率不足的部分）。"""
 
 
-def _analyze_detailed(image: str, prompt: str = "") -> str:
+def _analyze_detailed(
+    image: str,
+    prompt: str = "",
+    thinking: bool | None = None,
+) -> str:
     """对图片做完整描述：结构化分区主调用 + 一次全局查漏补缺。
 
     主调用用更大的 max_tokens/timeout（长模板 + 逐字转录时火山端响应明显更慢）；
@@ -306,7 +314,7 @@ def _analyze_detailed(image: str, prompt: str = "") -> str:
         f"{_DETAILED_TEMPLATE}\n\n补充关注点：{prompt}" if prompt
         else _DETAILED_TEMPLATE
     )
-    first = _analyze(image, first_prompt, max_tokens=4096, timeout=240)
+    first = _analyze(image, first_prompt, max_tokens=4096, timeout=240, thinking=thinking)
     try:
         detail = _analyze(
             image,
@@ -316,10 +324,125 @@ def _analyze_detailed(image: str, prompt: str = "") -> str:
             f"已有描述：\n{first[:3000]}",
             max_tokens=2048,
             timeout=180,
+            thinking=thinking,
         )
         return f"{first}\n\n【查漏补充】\n{detail}"
     except Exception:
         return first
+
+
+# ---------------------------------------------------------------------------
+# OCR 数字校准：视觉负责语义，OCR 负责精确数字。
+# 视觉描述完成后，把 OCR 高置信数字并入，替换描述中对应数值。
+# ---------------------------------------------------------------------------
+
+def _calibrate_numbers(vision_text: str, ocr_items: list[dict]) -> str:
+    """用 OCR 高置信数字校准视觉描述中的数字。
+
+    策略：把视觉描述中与 OCR 冲突的小数就地替换为 OCR 值（数值差 ≤5 视为
+    同一数值的转录偏差），再追加一行"OCR 校准"说明列出全部高置信数字。
+    """
+    if not ocr_items:
+        return vision_text
+    high = [it for it in ocr_items if it["score"] >= 0.9]
+    if not high:
+        return vision_text
+    tokens = [it["text"].strip() for it in high if it["text"].strip()]
+    if not tokens:
+        return vision_text
+
+    ocr_nums = {t for t in tokens if re.fullmatch(r"\d+(\.\d+)?", t)}
+    replaced = False
+    if ocr_nums:
+        def _repl(m: re.Match) -> str:
+            nonlocal replaced
+            v = m.group(0)
+            if v in ocr_nums:
+                return v
+            try:
+                fv = float(v)
+            except ValueError:
+                return v
+            best, bd = None, None
+            for t in ocr_nums:
+                try:
+                    d = abs(float(t) - fv)
+                except ValueError:
+                    continue
+                if bd is None or d < bd:
+                    bd, best = d, t
+            if best is not None and bd is not None and bd <= 5 and best != v:
+                replaced = True
+                return best
+            return v
+        vision_text = re.sub(r"\d+\.\d+", _repl, vision_text)
+
+    missing = [t for t in tokens if t not in vision_text]
+    if replaced:
+        return vision_text + "\n\n【OCR 校准】正文数字已按本地 OCR 高置信结果替换。"
+    if not missing:
+        return vision_text
+    calib = "\n\n【OCR 校准】以下数字经本地 OCR 高置信识别（≥0.9）：\n- " + "\n- ".join(missing)
+    return vision_text + calib
+
+
+def _resolve_thinking(detail: bool, ocr_calibrate: bool, thinking: bool | None) -> bool | None:
+    """按场景决定思考默认值，thinking 显式传入时覆盖。"""
+    if thinking is not None:
+        return thinking
+    if detail:
+        return True   # 完整描述需要深度推理
+    if ocr_calibrate:
+        return False  # OCR 校准下视觉只快描述，数字交给 OCR
+    return False      # 普通快速浏览
+
+
+def _run_analysis(
+    image_path: str,
+    prompt: str,
+    detail: bool,
+    ocr_calibrate: bool,
+    thinking: bool | None = None,
+) -> str:
+    """对已落盘的图片执行视觉分析，可选叠加 OCR 数字校准。
+
+    Args:
+        image_path: 已写入磁盘的图片文件路径（调用方负责创建与清理）。
+        prompt: 视觉模型的关注点。
+        detail: 是否使用完整描述模式。
+        ocr_calibrate: 是否启用本地 OCR 数字校准 + 结构化 JSON。
+        thinking: None=按场景默认；True/False=强制开/关思考。
+    """
+    try:
+        import ocr_extract
+    except ImportError:
+        ocr_extract = None
+
+    think = _resolve_thinking(detail, ocr_calibrate, thinking)
+
+    # 1. 视觉描述（带思考设置）
+    if detail:
+        vision = _analyze_detailed(image_path, prompt, thinking=think)
+    else:
+        vision = _analyze(image_path, prompt, thinking=think)
+
+    if not ocr_calibrate or ocr_extract is None:
+        return vision
+
+    # 2. OCR 提取（直接用已落盘的路径，不重复写盘）
+    items = ocr_extract.ocr_extract(image_path, min_score=0.7)
+
+    if items is None:
+        return vision + "\n\n（OCR 引擎不可用，未校准）"
+    if not items:
+        return vision + "\n\n（OCR 未识别到文字，未校准）"
+
+    # 3. 校准 + JSON
+    calibrated = _calibrate_numbers(vision, items)
+    j = ocr_extract.ocr_to_json(items)
+    if j:
+        calibrated += "\n\n```json\n" + json.dumps(j, ensure_ascii=False, indent=2) + "\n```"
+    return calibrated
 
 
 # ---------------------------------------------------------------------------
@@ -719,19 +842,32 @@ def analyze_image(
     image: str,
     prompt: str = "请详细描述这张图片的内容。",
     detail: bool = False,
+    ocr_calibrate: bool = False,
+    thinking: bool | None = None,
 ) -> str:
     """分析一张图片，返回视觉模型的文字描述。
 
     Args:
         image: 图片来源 —— 本地文件路径，或 http(s) URL，或 data URL，或 base64。
         prompt: 想要模型关注什么（默认详细描述）。
-        detail: 设为 True 时启用完整描述模式 —— 结构化分区 + 四象限两轮补齐，
+        detail: 设为 True 时启用完整描述模式 —— 结构化分区 + 查漏补缺，
                 尽量捕获全部文字/数字/表格，适合学术文献页等需要完整信息的场景。
+        ocr_calibrate: 设为 True 时启用本地 OCR 数字校准 —— 视觉负责语义、
+            布局，OCR 提供精确数字，并输出结构化 JSON。可配 detail 一起用。
+        thinking: None=按场景默认（detail 开、其余关）；True/False=强制覆盖。
     """
     try:
-        if detail:
-            return _analyze_detailed(image, prompt)
-        return _analyze(image, prompt)
+        data, mime, _ = _read_image_bytes(image)
+        if len(data) > MAX_IMAGE_BYTES:
+            return f"[vision-mcp 错误] 图片过大（{len(data)} bytes），上限 {MAX_IMAGE_BYTES}"
+        fd, tmp = tempfile.mkstemp(suffix=".png")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            return _run_analysis(tmp, prompt, detail, ocr_calibrate, thinking)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
     except Exception as e:
         return f"[vision-mcp 错误] {e}"
 
@@ -739,7 +875,10 @@ def analyze_image(
 @mcp.tool()
 def describe_image(image: str) -> str:
     """快速浏览图片：输出一段通用描述（适合不指定任务的场合）。"""
-    return _analyze(image, "请用简洁的中文描述这张图片的大致内容。")
+    try:
+        return _analyze(image, "请用简洁的中文描述这张图片的大致内容。", thinking=False)
+    except Exception as e:
+        return f"[vision-mcp 错误] {e}"
 
 
 @mcp.tool()
