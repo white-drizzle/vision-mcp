@@ -287,7 +287,7 @@ def _analyze(
     )
 
 
-_DETAILED_TEMPLATE = """我是DeepSeek，没有多模态，请你作为我的眼睛返回图片的信息：
+DEFAULT_VISION_PROMPT = """我是DeepSeek，没有多模态，请你作为我的眼睛返回图片的信息：
 1. 内容：逐字转录所有文字、数字、表格（不要概括、不要改写），保留精确数值。
 2. 布局：分区位置、层级、视觉重点，可给出坐标。
 3. 图表：坐标轴、刻度、图例、色标数值。
@@ -305,8 +305,8 @@ def _analyze_detailed(
     用更大的 max_tokens/timeout（逐字转录时火山端响应更慢）。
     """
     first_prompt = (
-        f"{_DETAILED_TEMPLATE}\n\n补充关注点：{prompt}" if prompt
-        else _DETAILED_TEMPLATE
+        f"{DEFAULT_VISION_PROMPT}\n\n补充关注点：{prompt}" if prompt
+        else DEFAULT_VISION_PROMPT
     )
     return _analyze(image, first_prompt, max_tokens=4096, timeout=240, thinking=thinking)
 
@@ -717,7 +717,7 @@ def check_ppt_overlap(
 @mcp.tool()
 def analyze_image(
     image: str,
-    prompt: str = "请详细描述这张图片的内容。",
+    prompt: str = "",
     detail: bool = False,
     thinking: bool | None = None,
 ) -> str:
@@ -725,10 +725,9 @@ def analyze_image(
 
     Args:
         image: 图片来源 —— 本地文件路径，或 http(s) URL，或 data URL，或 base64。
-        prompt: 想要模型关注什么（默认详细描述）。
-        detail: 设为 True 时启用完整描述模式 —— 结构化分区 + 查漏补缺，
-                尽量捕获全部文字/数字/表格，适合学术文献页等需要完整信息的场景。
-        thinking: None=按场景默认（detail 开、其余关）；True/False=强制覆盖。
+        prompt: 想要模型关注什么。默认用完整转录提示词（逐字转录 + 布局/坐标/图表 + 异常检测）。
+        detail: 设为 True 时用更大的输出上限，避免长图转录被截断。
+        thinking: True/False 强制开/关深度思考；None=默认关。
     """
     try:
         data, mime, _ = _read_image_bytes(image)
@@ -741,7 +740,7 @@ def analyze_image(
             think = _resolve_thinking(detail, thinking)
             if detail:
                 return _analyze_detailed(tmp, prompt, thinking=think)
-            return _analyze(tmp, prompt, thinking=think)
+            return _analyze(tmp, prompt or DEFAULT_VISION_PROMPT, thinking=think)
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -760,7 +759,7 @@ def describe_image(image: str) -> str:
 
 @mcp.tool()
 def analyze_pasted_image(
-    prompt: str = "请用中文详细描述这张图片的内容。",
+    prompt: str = "",
     detail: bool = False,
     thinking: bool | None = None,
 ) -> str:
@@ -770,10 +769,9 @@ def analyze_pasted_image(
     找不到时回退到系统临时目录扫描近期图片文件。
 
     Args:
-        prompt: 想要模型关注什么（默认详细描述）。
-        detail: 设为 True 时启用完整描述模式 —— 结构化分区 + 查漏补缺，
-                尽量捕获全部文字/数字/表格，适合学术文献页等需要完整信息的场景。
-        thinking: None=按场景默认（detail 开、其余关）；True/False=强制覆盖。
+        prompt: 想要模型关注什么。默认用完整转录提示词（逐字转录 + 布局/坐标/图表 + 异常检测）。
+        detail: 设为 True 时用更大的输出上限，避免长图转录被截断。
+        thinking: True/False 强制开/关深度思考；None=默认关。
     """
     try:
         data, mime, source = _resolve_pasted_image()
@@ -787,7 +785,7 @@ def analyze_pasted_image(
             if detail:
                 result = _analyze_detailed(tmp, prompt, thinking=think)
             else:
-                result = _analyze(tmp, prompt, thinking=think)
+                result = _analyze(tmp, prompt or DEFAULT_VISION_PROMPT, thinking=think)
             return result + f"\n\n（图片来源：{source}）"
         finally:
             if os.path.exists(tmp):
