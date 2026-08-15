@@ -214,7 +214,7 @@ def _thinking_payload(payload: dict, thinking: bool | None) -> dict:
 
 def _chat(
     messages: list[dict],
-    max_tokens: int = 2048,
+    max_tokens: int = 4096,
     timeout: float = 90,
     thinking: bool | None = None,
 ) -> dict:
@@ -308,7 +308,7 @@ def _analyze_detailed(
         f"{DEFAULT_VISION_PROMPT}\n\n补充关注点：{prompt}" if prompt
         else DEFAULT_VISION_PROMPT
     )
-    return _analyze(image, first_prompt, max_tokens=4096, timeout=240, thinking=thinking)
+    return _analyze(image, first_prompt, max_tokens=8192, timeout=240, thinking=thinking)
 
 
 def _resolve_thinking(detail: bool, thinking: bool | None) -> bool | None:
@@ -820,5 +820,13 @@ def analyze_html(
         return f"[vision-mcp 错误] {e}"
 
 
+def _check_key() -> None:
+    if not os.environ.get("ARK_AUTH_TOKEN", "").strip():
+        print("[super-research-plugin] 未配置 ARK_AUTH_TOKEN。", file=sys.stderr)
+        print("请到插件设置 → userConfig 填写，然后重启会话。", file=sys.stderr)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
+    _check_key()
     mcp.run(transport="stdio")
